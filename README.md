@@ -5,8 +5,15 @@ Presentation-ready dashboard for the AI + Post-Quantum Cryptography research pro
 ## Quick Start
 
 ```bash
+cd ~/AI_PQC_UI
 pip install -r requirements.txt
-streamlit run app.py
+python api.py
+```
+
+```bash
+cd ~/AI_PQC_UI/frontend
+npm install
+npm run dev
 ```
 
 ## Features
