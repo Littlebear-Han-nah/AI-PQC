@@ -1,250 +1,485 @@
-"""检测流水线、异常解释与可视化数据构建。"""
+"""Pipeline orchestration, risk policy, logging, and visualization helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Generator, Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 
-from data import FEATURE_COLUMNS, FEATURE_LABELS_ZH
-from model import AnomalyResult, train_detector
-from pqc import PQCDecision, PQCSimulator
+from model import (
+    AnomalyResult,
+    Contamination,
+    FlowAnomalyDetector,
+    evaluate_predictions,
+    train_detector,
+)
+from pqc import PQCSimulator
 
 
 @dataclass
 class SampleResult:
     sample_id: int
-    duration: float
-    packet_count: int
-    byte_size: int
-    src_bytes: int
-    dst_bytes: int
-    flow_rate: float
-    label: str
     status: str
+    risk_level: str
     risk: float
-    score: float
+    raw_score: float
     pqc_action: str
     algorithm: str
-    explanation: str
-    switched: bool = False
-    renegotiated: bool = False
+    response_triggered: bool
+    trigger_reason: str
 
 
 @dataclass
 class PipelineResult:
     rows: list[SampleResult] = field(default_factory=list)
-    logs: list[dict] = field(default_factory=list)
+    logs: list[str] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     summary: dict = field(default_factory=dict)
-    scores: list[float] = field(default_factory=list)
-    labels: list[int] = field(default_factory=list)
+    scores: np.ndarray = field(default_factory=lambda: np.array([]))
+    labels: np.ndarray = field(default_factory=lambda: np.array([]))
 
 
-def build_log(level: str, message: str, sample_id: Optional[int] = None) -> dict:
-    return {"level": level, "message": message, "sample_id": sample_id}
+@dataclass
+class RiskPolicyState:
+    medium_streak: int = 0
+    direct_renegotiations: int = 0
+    streak_renegotiations: int = 0
 
 
-def explain_anomaly(row: pd.Series, medians: pd.Series, status: str) -> str:
-    if status == "NORMAL":
-        return (
-            "该流量各特征值处于正常区间，Isolation Forest 未检测到显著偏离，"
-            "维持 Kyber512 标准后量子加密模式。"
-        )
-
-    reasons = []
-    for col in FEATURE_COLUMNS:
-        val = float(row[col])
-        med = float(medians[col])
-        if med == 0:
-            ratio = val
-        else:
-            ratio = val / med
-        if ratio > 2.5:
-            reasons.append(
-                f"{FEATURE_LABELS_ZH[col]}({val:.1f}) 显著高于中位数({med:.1f})"
-            )
-        elif ratio < 0.4 and val > 0:
-            reasons.append(
-                f"{FEATURE_LABELS_ZH[col]}({val:.1f}) 显著低于中位数({med:.1f})"
-            )
-
-    if not reasons:
-        reasons.append("综合特征组合偏离正常流量分布（Isolation Forest 低分）")
-
-    return "异常原因：" + "；".join(reasons[:3]) + "。已触发 Kyber768 升级与密钥重协商。"
+def build_log_entry(level: str, message: str) -> str:
+    return f"[{level}] {message}"
 
 
 def run_detection_pipeline(
-    df: pd.DataFrame,
-    default_pqc_mode: str = "Kyber512",
+    X_train: np.ndarray,
+    X_test: Optional[np.ndarray] = None,
+    y_test: Optional[np.ndarray] = None,
     random_state: int = 42,
+    contamination: Contamination = 0.1,
+    detector: Optional[FlowAnomalyDetector] = None,
+    language: str = "en",
+    risk_policy_mode: str = "manual",
+    low_threshold: float = 0.45,
+    high_threshold: float = 0.75,
+    medium_streak_n: int = 3,
+    live_callback: Optional[Callable[[SampleResult, list[str]], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> PipelineResult:
-    X = df[FEATURE_COLUMNS].values.astype(float)
-    y = df["label"].values if "label" in df.columns else None
-    medians = df[FEATURE_COLUMNS].median()
+    """
+    Run Isolation Forest + simulated PQC response.
 
-    detector, metrics = train_detector(X, y, random_state=random_state)
-    predictions = detector.predict_with_scores(X)
-    pqc = PQCSimulator(default_mode=default_pqc_mode)
+    risk_policy_mode:
+        "auto" uses Isolation Forest's internal contamination-derived threshold.
+        "manual" uses low/high risk thresholds and the medium-streak rule.
+    """
+    if X_test is None:
+        X_test = X_train
 
-    result = PipelineResult(metrics=metrics)
-    result.scores = detector.score_samples(X).tolist()
-    result.labels = detector.predict(X).tolist()
+    if detector is None:
+        detector, _ = train_detector(
+            X_train,
+            random_state=random_state,
+            contamination=contamination,
+        )
+
+    predictions = detector.predict_with_scores(X_test)
+    pqc = PQCSimulator()
+    policy_state = RiskPolicyState()
+    policy_labels: list[int] = []
+    processed_scores: list[float] = []
+    result = PipelineResult()
 
     for idx, pred in enumerate(predictions):
-        row = df.iloc[idx]
-        is_anomaly = pred.label == -1
-        decision = pqc.process_sample(idx, is_anomaly)
-        sample = _build_sample(idx, row, pred, decision, medians)
-        result.rows.append(sample)
-        result.logs.extend(_sample_logs(sample, decision))
+        if should_stop is not None and should_stop():
+            result.logs.append(build_log_entry("INFO", _log_text(language, "stopped")))
+            break
 
+        sample, batch_logs, policy_label = build_policy_sample(
+            idx,
+            pred,
+            pqc,
+            policy_state,
+            risk_policy_mode=risk_policy_mode,
+            low_threshold=low_threshold,
+            high_threshold=high_threshold,
+            medium_streak_n=medium_streak_n,
+            language=language,
+        )
+        result.rows.append(sample)
+        result.logs.extend(batch_logs)
+        policy_labels.append(policy_label)
+        processed_scores.append(pred.score)
+
+        if live_callback:
+            live_callback(sample, batch_logs)
+
+    risk_counts = _risk_counts(result.rows)
     anomaly_count = sum(1 for r in result.rows if r.status == "ANOMALY")
+    result.scores = np.array(processed_scores)
+    result.labels = np.array(policy_labels)
+    if y_test is not None and len(policy_labels) > 0:
+        result.metrics = evaluate_predictions(y_test[: len(policy_labels)], result.labels)
+
     result.summary = {
         "total": len(result.rows),
-        "normal": len(result.rows) - anomaly_count,
         "anomalies": anomaly_count,
+        "normal": len(result.rows) - anomaly_count,
+        "low_risk": risk_counts["LOW"],
+        "medium_risk": risk_counts["MEDIUM"],
+        "high_risk": risk_counts["HIGH"],
         "renegotiations": pqc.state.renegotiation_count,
+        "direct_renegotiations": policy_state.direct_renegotiations,
+        "streak_renegotiations": policy_state.streak_renegotiations,
         "final_algorithm": pqc.current_algorithm,
-        "system_status": "alert" if anomaly_count > 0 else "secure",
+        "stopped": len(result.rows) < len(predictions),
+        "configured_total": len(predictions),
+        "risk_policy_mode": risk_policy_mode,
     }
     return result
 
 
-def stream_detection_pipeline(
-    df: pd.DataFrame,
-    default_pqc_mode: str = "Kyber512",
-    random_state: int = 42,
-) -> Generator[dict[str, Any], None, PipelineResult]:
-    """逐条产出检测事件，供 SSE 实时推送。"""
-    X = df[FEATURE_COLUMNS].values.astype(float)
-    y = df["label"].values if "label" in df.columns else None
-    medians = df[FEATURE_COLUMNS].median()
-
-    detector, metrics = train_detector(X, y, random_state=random_state)
-    predictions = detector.predict_with_scores(X)
-    pqc = PQCSimulator(default_mode=default_pqc_mode)
-
-    result = PipelineResult(metrics=metrics)
-    result.scores = detector.score_samples(X).tolist()
-    result.labels = detector.predict(X).tolist()
-
-    yield {"type": "init", "total": len(predictions), "metrics": metrics}
-
-    for idx, pred in enumerate(predictions):
-        row = df.iloc[idx]
-        decision = pqc.process_sample(idx, pred.label == -1)
-        sample = _build_sample(idx, row, pred, decision, medians)
-        logs = _sample_logs(sample, decision)
-        result.rows.append(sample)
-        result.logs.extend(logs)
-        yield {
-            "type": "sample",
-            "sample": sample_to_dict(sample),
-            "logs": logs,
-            "progress": (idx + 1) / len(predictions),
-            "pqc_mode": pqc.current_algorithm,
-            "renegotiations": pqc.state.renegotiation_count,
-        }
-
-    anomaly_count = sum(1 for r in result.rows if r.status == "ANOMALY")
-    result.summary = {
-        "total": len(result.rows),
-        "normal": len(result.rows) - anomaly_count,
-        "anomalies": anomaly_count,
-        "renegotiations": pqc.state.renegotiation_count,
-        "final_algorithm": pqc.current_algorithm,
-        "system_status": "alert" if anomaly_count > 0 else "secure",
-    }
-    return result
-
-
-def _build_sample(
+def build_policy_sample(
     idx: int,
-    row: pd.Series,
     pred: AnomalyResult,
-    decision: PQCDecision,
-    medians: pd.Series,
-) -> SampleResult:
-    gt = row.get("label", pred.label)
-    label_zh = "异常" if (gt == -1 or pred.label == -1) else "正常"
-    if pred.label == -1:
-        label_zh = "异常"
-    elif pred.label == 1:
-        label_zh = "正常"
+    pqc: PQCSimulator,
+    policy_state: RiskPolicyState,
+    risk_policy_mode: str,
+    low_threshold: float,
+    high_threshold: float,
+    medium_streak_n: int,
+    language: str = "en",
+) -> tuple[SampleResult, list[str], int]:
+    if risk_policy_mode == "auto":
+        return _build_auto_policy_sample(idx, pred, pqc, policy_state, language)
 
+    risk_level = classify_risk(pred.risk, low_threshold, high_threshold)
+    response_triggered = False
+    trigger_reason = "pass"
+
+    if risk_level == "LOW":
+        policy_state.medium_streak = 0
+        pqc.switch_to_kyber512()
+        pqc_action = "Pass"
+    elif risk_level == "MEDIUM":
+        policy_state.medium_streak += 1
+        if policy_state.medium_streak >= medium_streak_n:
+            pqc.switch_to_kyber768()
+            pqc.renegotiate_key()
+            policy_state.streak_renegotiations += 1
+            response_triggered = True
+            trigger_reason = "medium_streak"
+            pqc_action = "Kyber768 simulated renegotiation"
+            policy_state.medium_streak = 0
+        else:
+            pqc.switch_to_kyber512()
+            trigger_reason = "medium_monitor"
+            pqc_action = "Monitor"
+    else:
+        policy_state.medium_streak = 0
+        pqc.switch_to_kyber768()
+        pqc.renegotiate_key()
+        policy_state.direct_renegotiations += 1
+        response_triggered = True
+        trigger_reason = "high_risk"
+        pqc_action = "Kyber768 simulated renegotiation"
+
+    status = "ANOMALY" if response_triggered else "NORMAL"
+    sample = _build_sample_result(
+        idx,
+        pred,
+        risk_level=risk_level,
+        status=status,
+        pqc_action=pqc_action,
+        algorithm=pqc.current_algorithm,
+        response_triggered=response_triggered,
+        trigger_reason=trigger_reason,
+    )
+    return sample, _build_sample_logs(sample, language, medium_streak_n), -1 if response_triggered else 1
+
+
+def _build_auto_policy_sample(
+    idx: int,
+    pred: AnomalyResult,
+    pqc: PQCSimulator,
+    policy_state: RiskPolicyState,
+    language: str,
+) -> tuple[SampleResult, list[str], int]:
+    policy_state.medium_streak = 0
+    if pred.label == -1:
+        pqc.switch_to_kyber768()
+        pqc.renegotiate_key()
+        policy_state.direct_renegotiations += 1
+        sample = _build_sample_result(
+            idx,
+            pred,
+            risk_level="MODEL_ANOMALY",
+            status="ANOMALY",
+            pqc_action="Kyber768 simulated renegotiation",
+            algorithm=pqc.current_algorithm,
+            response_triggered=True,
+            trigger_reason="model_anomaly",
+        )
+        return sample, _build_sample_logs(sample, language), -1
+
+    pqc.switch_to_kyber512()
+    sample = _build_sample_result(
+        idx,
+        pred,
+        risk_level="MODEL_NORMAL",
+        status="NORMAL",
+        pqc_action="Pass",
+        algorithm=pqc.current_algorithm,
+        response_triggered=False,
+        trigger_reason="model_normal",
+    )
+    return sample, _build_sample_logs(sample, language), 1
+
+
+def classify_risk(risk: float, low_threshold: float, high_threshold: float) -> str:
+    if risk < low_threshold:
+        return "LOW"
+    if risk < high_threshold:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def _build_sample_result(
+    idx: int,
+    pred: AnomalyResult,
+    risk_level: str,
+    status: str,
+    pqc_action: str,
+    algorithm: str,
+    response_triggered: bool,
+    trigger_reason: str,
+) -> SampleResult:
     return SampleResult(
         sample_id=idx,
-        duration=float(row["duration"]),
-        packet_count=int(row["packet_count"]),
-        byte_size=int(row["byte_size"]),
-        src_bytes=int(row["src_bytes"]),
-        dst_bytes=int(row["dst_bytes"]),
-        flow_rate=float(row["flow_rate"]),
-        label=label_zh,
-        status=decision.status,
-        risk=round(pred.risk, 2),
-        score=round(pred.score, 4),
-        pqc_action=decision.pqc_action,
-        algorithm=decision.algorithm,
-        explanation=explain_anomaly(row, medians, decision.status),
-        switched=decision.switched,
-        renegotiated=decision.renegotiated,
+        status=status,
+        risk_level=risk_level,
+        risk=pred.risk,
+        raw_score=pred.score,
+        pqc_action=pqc_action,
+        algorithm=algorithm,
+        response_triggered=response_triggered,
+        trigger_reason=trigger_reason,
     )
 
 
-def _sample_logs(sample: SampleResult, decision: PQCDecision) -> list[dict]:
-    logs: list[dict] = []
-    if sample.status == "ANOMALY":
-        logs.append(
-            build_log(
-                "warning",
-                f"流量 {sample.sample_id} → 触发 Kyber768 切换",
-                sample.sample_id,
+def _build_sample_logs(
+    sample: SampleResult,
+    language: str = "en",
+    medium_streak_n: int = 3,
+) -> list[str]:
+    if sample.trigger_reason == "model_anomaly":
+        return [
+            build_log_entry("WARNING", _log_text(language, "model_anomaly", sample.sample_id)),
+            build_log_entry("INFO", _log_text(language, "renegotiation")),
+        ]
+    if sample.trigger_reason == "model_normal":
+        return [build_log_entry("INFO", _log_text(language, "model_normal", sample.sample_id))]
+    if sample.trigger_reason == "high_risk":
+        return [
+            build_log_entry("WARNING", _log_text(language, "high", sample.sample_id)),
+            build_log_entry("INFO", _log_text(language, "renegotiation")),
+        ]
+    if sample.trigger_reason == "medium_streak":
+        return [
+            build_log_entry(
+                "WARNING",
+                _log_text(language, "medium_trigger", sample.sample_id, medium_streak_n),
+            ),
+            build_log_entry("INFO", _log_text(language, "renegotiation")),
+        ]
+    if sample.trigger_reason == "medium_monitor":
+        return [
+            build_log_entry(
+                "INFO",
+                _log_text(language, "medium_monitor", sample.sample_id, medium_streak_n),
             )
-        )
-        logs.append(build_log("system", "已触发密钥重新协商", sample.sample_id))
-    else:
-        logs.append(
-            build_log(
-                "info",
-                f"流量 {sample.sample_id} → 使用 Kyber512",
-                sample.sample_id,
-            )
-        )
-    return logs
+        ]
+    return [build_log_entry("INFO", _log_text(language, "low", sample.sample_id))]
 
 
-def sample_to_dict(sample: SampleResult) -> dict:
+def _log_text(
+    language: str,
+    key: str,
+    sample_id: int | None = None,
+    medium_streak_n: int = 3,
+) -> str:
+    zh = language == "zh"
+    if key == "stopped":
+        return "用户已中止检测" if zh else "Detection stopped by user"
+    if key == "renegotiation":
+        return "已触发模拟密钥重协商" if zh else "Simulated key renegotiation triggered"
+    if key == "model_anomaly":
+        return (
+            f"样本 {sample_id} -> 模型判定异常 -> 模拟重协商"
+            if zh
+            else f"Sample {sample_id} -> model anomaly -> simulated renegotiation"
+        )
+    if key == "model_normal":
+        return (
+            f"样本 {sample_id} -> 模型判定正常 -> 通过"
+            if zh
+            else f"Sample {sample_id} -> model normal -> pass"
+        )
+    if key == "high":
+        return (
+            f"样本 {sample_id} -> 高风险 -> 立即模拟重协商"
+            if zh
+            else f"Sample {sample_id} -> HIGH risk -> immediate simulated renegotiation"
+        )
+    if key == "medium_trigger":
+        return (
+            f"样本 {sample_id} -> 中风险连续 {medium_streak_n} 次 -> 模拟重协商"
+            if zh
+            else f"Sample {sample_id} -> MEDIUM risk streak {medium_streak_n}/{medium_streak_n} -> simulated renegotiation"
+        )
+    if key == "medium_monitor":
+        return (
+            f"样本 {sample_id} -> 中风险 -> 持续监测"
+            if zh
+            else f"Sample {sample_id} -> MEDIUM risk -> monitor"
+        )
+    return f"样本 {sample_id} -> 低风险 -> 通过" if zh else f"Sample {sample_id} -> LOW risk -> pass"
+
+
+def _risk_counts(rows: list[SampleResult]) -> dict[str, int]:
     return {
-        "sample_id": sample.sample_id,
-        "duration": sample.duration,
-        "packet_count": sample.packet_count,
-        "byte_size": sample.byte_size,
-        "src_bytes": sample.src_bytes,
-        "dst_bytes": sample.dst_bytes,
-        "flow_rate": sample.flow_rate,
-        "label": sample.label,
-        "status": sample.status,
-        "risk": sample.risk,
-        "score": sample.score,
-        "pqc_action": sample.pqc_action,
-        "algorithm": sample.algorithm,
-        "explanation": sample.explanation,
-        "switched": sample.switched,
-        "renegotiated": sample.renegotiated,
+        "LOW": sum(1 for row in rows if row.risk_level in {"LOW", "MODEL_NORMAL"}),
+        "MEDIUM": sum(1 for row in rows if row.risk_level == "MEDIUM"),
+        "HIGH": sum(1 for row in rows if row.risk_level in {"HIGH", "MODEL_ANOMALY"}),
     }
 
 
-def pipeline_to_response(result: PipelineResult) -> dict:
-    return {
-        "rows": [sample_to_dict(r) for r in result.rows],
-        "logs": result.logs,
-        "metrics": result.metrics,
-        "summary": result.summary,
-        "scores": result.scores,
-        "labels": result.labels,
+def results_to_dataframe(rows: list[SampleResult], language: str = "en") -> pd.DataFrame:
+    labels = {
+        "sample_id": "样本 ID" if language == "zh" else "Sample ID",
+        "status": "状态" if language == "zh" else "Status",
+        "risk_level": "风险等级" if language == "zh" else "Risk Level",
+        "risk": "风险" if language == "zh" else "Risk",
+        "pqc_action": "PQC 动作" if language == "zh" else "PQC Action",
     }
+    return pd.DataFrame(
+        [
+            {
+                labels["sample_id"]: r.sample_id,
+                labels["status"]: _display_status(r.status, language),
+                labels["risk_level"]: _display_risk_level(r.risk_level, language),
+                labels["risk"]: round(r.risk, 2),
+                labels["pqc_action"]: r.pqc_action,
+            }
+            for r in rows
+        ]
+    )
+
+
+def styled_results_table(df: pd.DataFrame, language: str = "en"):
+    """Return a pandas Styler with green/red row highlighting."""
+    status_col = "状态" if language == "zh" else "Status"
+
+    def _row_style(row):
+        if row[status_col] in {"ANOMALY", "异常"}:
+            return [
+                "background-color: #fdecea; color: #922b21; font-weight: 600"
+            ] * len(row)
+        return [
+            "background-color: #eafaf1; color: #1e8449; font-weight: 500"
+        ] * len(row)
+
+    return df.style.apply(_row_style, axis=1)
+
+
+def _display_status(status: str, language: str) -> str:
+    if language != "zh":
+        return status
+    return "异常" if status == "ANOMALY" else "正常"
+
+
+def _display_risk_level(risk_level: str, language: str) -> str:
+    if language != "zh":
+        return risk_level
+    mapping = {
+        "LOW": "低",
+        "MEDIUM": "中",
+        "HIGH": "高",
+        "MODEL_NORMAL": "模型正常",
+        "MODEL_ANOMALY": "模型异常",
+    }
+    return mapping.get(risk_level, risk_level)
+
+
+def create_anomaly_score_figure(scores: np.ndarray, labels: np.ndarray) -> go.Figure:
+    colors = ["#e74c3c" if lbl == -1 else "#27ae60" for lbl in labels]
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=list(range(len(scores))),
+                y=scores,
+                marker_color=colors,
+                name="Anomaly score",
+            )
+        ]
+    )
+    fig.add_hline(
+        y=float(np.median(scores)),
+        line_dash="dash",
+        line_color="#2980b9",
+        annotation_text="Median",
+    )
+    fig.update_layout(
+        title="Anomaly Scores per Network Flow",
+        xaxis_title="Sample Index",
+        yaxis_title="Isolation Forest Score",
+        template="plotly_white",
+        height=360,
+        margin=dict(l=40, r=20, t=50, b=40),
+        showlegend=False,
+    )
+    return fig
+
+
+def create_status_count_figure(normal: int, anomaly: int) -> go.Figure:
+    fig = px.bar(
+        x=["Normal", "Anomaly"],
+        y=[normal, anomaly],
+        color=["Normal", "Anomaly"],
+        color_discrete_map={"Normal": "#27ae60", "Anomaly": "#e74c3c"},
+        text=[normal, anomaly],
+    )
+    fig.update_traces(textposition="outside")
+    fig.update_layout(
+        title="Traffic Classification Summary",
+        yaxis_title="Count",
+        template="plotly_white",
+        height=360,
+        showlegend=False,
+        margin=dict(l=40, r=20, t=50, b=40),
+    )
+    return fig
+
+
+def format_log_html(logs: list[str]) -> str:
+    """Render event logs with color-coded levels."""
+    lines = []
+    for entry in logs:
+        if "[WARNING]" in entry:
+            color = "#c0392b"
+            bg = "#fdf2f2"
+        elif "[INFO]" in entry:
+            color = "#1f618d"
+            bg = "#f4f9fd"
+        else:
+            color = "#566573"
+            bg = "#f8f9fa"
+        lines.append(
+            f'<div style="padding:6px 10px;margin:4px 0;border-radius:6px;'
+            f'background:{bg};color:{color};font-family:monospace;font-size:13px;">'
+            f"{entry}</div>"
+        )
+    return "".join(lines)

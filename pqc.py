@@ -1,4 +1,4 @@
-"""后量子密码学（PQC）模拟模块 — Kyber512 / Kyber768。"""
+"""Simulated Post-Quantum Cryptography (PQC) key management module."""
 
 from __future__ import annotations
 
@@ -32,33 +32,29 @@ class PQCDecision:
     pqc_action: str
     algorithm: str
     renegotiated: bool
-    switched: bool = False
 
 
 class PQCSimulator:
-    def __init__(self, default_mode: str = "Kyber512") -> None:
-        self.state = PQCState(
-            algorithm=KyberVariant(default_mode)
-            if default_mode in KyberVariant._value2member_map_
-            else KyberVariant.KYBER512
-        )
+    """Simulated PQC module: Kyber512 (normal) / Kyber768 (anomaly)."""
+
+    def __init__(self) -> None:
+        self.state = PQCState()
 
     @property
     def current_algorithm(self) -> str:
         return self.state.algorithm.value
 
-    def switch_to_kyber512(self) -> tuple[str, bool]:
+    def switch_to_kyber512(self) -> str:
         if self.state.algorithm == KyberVariant.KYBER512:
-            return self.state.session_key, False
+            return self.state.session_key
         self.state.algorithm = KyberVariant.KYBER512
         self.state.session_key = _generate_session_key("Kyber512")
-        return self.state.session_key, True
+        return self.state.session_key
 
-    def switch_to_kyber768(self) -> tuple[str, bool]:
-        switched = self.state.algorithm != KyberVariant.KYBER768
+    def switch_to_kyber768(self) -> str:
         self.state.algorithm = KyberVariant.KYBER768
         self.state.session_key = _generate_session_key("Kyber768")
-        return self.state.session_key, switched
+        return self.state.session_key
 
     def renegotiate_key(self) -> str:
         self.state.renegotiation_count += 1
@@ -67,7 +63,7 @@ class PQCSimulator:
 
     def process_sample(self, sample_id: int, is_anomaly: bool) -> PQCDecision:
         if is_anomaly:
-            _, switched = self.switch_to_kyber768()
+            self.switch_to_kyber768()
             self.renegotiate_key()
             return PQCDecision(
                 sample_id=sample_id,
@@ -75,8 +71,8 @@ class PQCSimulator:
                 pqc_action="Kyber768",
                 algorithm=self.state.algorithm.value,
                 renegotiated=True,
-                switched=switched or True,
             )
+
         self.switch_to_kyber512()
         return PQCDecision(
             sample_id=sample_id,
@@ -84,5 +80,13 @@ class PQCSimulator:
             pqc_action="Kyber512",
             algorithm=self.state.algorithm.value,
             renegotiated=False,
-            switched=False,
         )
+
+
+def get_backend_info() -> str:
+    try:
+        import oqs  # noqa: F401
+
+        return "liboqs available (simulation mode for demo)"
+    except ImportError:
+        return "PQC simulation mode (Kyber512 / Kyber768)"
